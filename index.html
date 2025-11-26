@@ -37,16 +37,16 @@
   <div class="card">
     <div class="hdr">
       <div>
-        <div class="title">Ink Labyrinth — Maze v2</div>
+        <div class="title">Ink Labyrinth（迷路）</div>
         <div class="hint">壁に触れる・インクがなくなるとゲームオーバー</div>
       </div>
 
       <div class="controls">
         <label style="font-size:13px">難易度</label>
         <select id="difficulty">
-          <option value="12">Easy (12×8)</option>
-          <option value="20" selected>Normal (20×12)</option>
-          <option value="28">Hard (28×18)</option>
+          <option value="12">簡単(12×8)</option>
+          <option value="20" selected>普通(20×12)</option>
+          <option value="28">難しい(28×18)</option>
         </select>
         <button id="regenBtn">再生成</button>
         <div style="width:12px"></div>
@@ -62,11 +62,6 @@
       <canvas id="drawCanvas"></canvas>     <!-- インクトレイル -->
       <div id="overlay" class="overlay" style="display:none"></div>
     </div>
-
-    <footer>
-      Tips: 指・マウスで描画。インクは移動距離で減る。出口に到達するとクリア。<br>
-      次はスプラッシュ / 色変化 / 床ギミック を追加できます。
-    </footer>
   </div>
 
 <script>
