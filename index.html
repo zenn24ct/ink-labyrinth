@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Ink Labyrinth（迷路）</title>
+<style>
+  :root{
+    --bg:#06070a; --card:#0b1220; --accent:#6ee7b7;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; min-height:100vh; font-family: Inter, "Hiragino Kaku Gothic ProN", "メイリオ", sans-serif;
+    background:linear-gradient(180deg,#02030a,#071022); color:#e6eef6;
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .card{
+    width:min(980px,96vw); border-radius:12px; padding:14px; background:var(--card);
+    box-shadow:0 12px 40px rgba(0,0,0,0.6);
+  }
+  .hdr{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px}
+  .title{font-weight:700}
+  .controls{display:flex; gap:10px; align-items:center}
+  .controls select, .controls button{padding:8px 10px; border-radius:8px; border:0; background:#0f1724; color:#e6eef6; cursor:pointer}
+  .status{display:flex; gap:10px; align-items:center}
+  .gauge{width:220px; height:12px; background:rgba(255,255,255,0.06); border-radius:8px; overflow:hidden}
+  .gauge > i{display:block; height:100%; background:linear-gradient(90deg,var(--accent),#60a5fa); width:100%; transition:width .08s linear}
+  .area{position:relative; width:920px; height:560px; margin:0 auto; border-radius:8px; overflow:hidden; touch-action:none}
+  canvas{position:absolute; left:0; top:0; display:block; user-select:none}
+  .overlay{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:26px; font-weight:700; pointer-events:none}
+  .hint{font-size:13px; color:rgba(230,238,246,0.75); margin-top:8px}
+  footer{margin-top:12px; font-size:13px; color:rgba(200,220,240,0.6)}
+  @media(max-width:980px){ .area{width:92vw; height:56vw} }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="hdr">
+      <div>
+        <div class="title">Ink Labyrinth — Maze v2</div>
+        <div class="hint">壁に触れる・インクがなくなるとゲームオーバー</div>
+      </div>
+
+      <div class="controls">
+        <label style="font-size:13px">難易度</label>
+        <select id="difficulty">
+          <option value="12">Easy (12×8)</option>
+          <option value="20" selected>Normal (20×12)</option>
+          <option value="28">Hard (28×18)</option>
+        </select>
+        <button id="regenBtn">再生成</button>
+        <div style="width:12px"></div>
+        <div class="status">
+          <div class="gauge" title="Ink"><i id="gauge" style="width:100%"></i></div>
+          <div style="min-width:56px; text-align:right;"><span id="inkTxt">100%</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="playArea" class="area">
+      <canvas id="mazeCanvas"></canvas>     <!-- 迷路（白が道） -->
+      <canvas id="drawCanvas"></canvas>     <!-- インクトレイル -->
+      <div id="overlay" class="overlay" style="display:none"></div>
+    </div>
+
+    <footer>
+      Tips: 指・マウスで描画。インクは移動距離で減る。出口に到達するとクリア。<br>
+      次はスプラッシュ / 色変化 / 床ギミック を追加できます。
+    </footer>
+  </div>
+
+<script>
+/* Ink Labyrinth — Maze v2
+   - Maze generator: recursive backtracker on grid of cells
+   - Render maze as white corridors on black background
+   - Ink drawing on overlay canvas, with pixel-based wall collision
+   - Simple UI: difficulty (grid size) and regenerate button
+*/
+
+/* ---------- DOM ---------- */
+const mazeCanvas = document.getElementById('mazeCanvas');
+const mazeCtx = mazeCanvas.getContext('2d', {willReadFrequently:true});
+const drawCanvas = document.getElementById('drawCanvas');
+const drawCtx = drawCanvas.getContext('2d');
+const playArea = document.getElementById('playArea');
+const regenBtn = document.getElementById('regenBtn');
+const difficulty = document.getElementById('difficulty');
+const overlay = document.getElementById('overlay');
+const gaugeEl = document.getElementById('gauge');
+const inkTxt = document.getElementById('inkTxt');
+
+/* ---------- State ---------- */
+let W, H;                 // canvas pixel size
+let cols, rows;           // maze grid
+let cellSize = 32;        // pixels per cell (will adjust)
+let mazeGrid = [];        // cell data
+let current = null;
+let ink = 1.0;            // 0..1
+const INK_DRAIN_PER_PX = 0.00025;
+let drawing = false;
+let lastPos = null;
+let gameOver = false;
+let exitCell = null;
+
+/* ---------- Utility ---------- */
+// resize canvases to fit playArea and recompute sizes
+function fitCanvases(){
+  const rect = playArea.getBoundingClientRect();
+  mazeCanvas.width = rect.width;
+  mazeCanvas.height = rect.height;
+  drawCanvas.width = rect.width;
+  drawCanvas.height = rect.height;
+  W = mazeCanvas.width; H = mazeCanvas.height;
+}
+
+/* ---------- Maze generation (grid, recursive backtracker) ---------- */
+// Cell object: {x,y,walls: {n,e,s,w}, visited}
+function makeGrid(c,r){
+  cols = c; rows = r;
+  mazeGrid = [];
+  for(let y=0;y<rows;y++){
+    for(let x=0;x<cols;x++){
+      mazeGrid.push({x,y,visited:false,walls:{n:true,e:true,s:true,w:true}});
+    }
+  }
+}
+function idx(x,y){ if(x<0||y<0||x>=cols||y>=rows) return -1; return y*cols + x; }
+function neighbors(cell){
+  const n = [];
+  const {x,y} = cell;
+  const dirs = [
+    {dx:0,dy:-1,dir:'n'}, {dx:1,dy:0,dir:'e'},
+    {dx:0,dy:1,dir:'s'}, {dx:-1,dy:0,dir:'w'}
+  ];
+  for(const d of dirs){
+    const ni = idx(x+d.dx, y+d.dy);
+    if(ni>=0 && !mazeGrid[ni].visited) n.push({cell:mazeGrid[ni],dir:d.dir});
+  }
+  return n;
+}
+function removeWall(a,b){
+  // remove wall between adjacent cells a and b
+  const dx = b.x - a.x, dy = b.y - a.y;
+  if(dx === 1){ a.walls.e = false; b.walls.w = false; }
+  else if(dx === -1){ a.walls.w = false; b.walls.e = false; }
+  else if(dy === 1){ a.walls.s = false; b.walls.n = false; }
+  else if(dy === -1){ a.walls.n = false; b.walls.s = false; }
+}
+function generateMaze(){
+  // recursive backtracker (iterative using stack)
+  const start = mazeGrid[0];
+  start.visited = true;
+  const stack = [start];
+  while(stack.length){
+    const cur = stack[stack.length-1];
+    const nbs = neighbors(cur);
+    if(nbs.length){
+      const pick = nbs[Math.floor(Math.random()*nbs.length)];
+      removeWall(cur, pick.cell);
+      pick.cell.visited = true;
+      stack.push(pick.cell);
+    } else {
+      stack.pop();
+    }
+  }
+}
+
+/* ---------- Maze rendering ---------- */
+// We render corridors by filling black background then drawing white rectangles for paths
+function renderMaze(){
+  mazeCtx.clearRect(0,0,W,H);
+  // black background
+  mazeCtx.fillStyle = '#000';
+  mazeCtx.fillRect(0,0,W,H);
+
+  // compute cell pixel size to fit grid
+  // leave small padding around edges
+  const padding = 12;
+  const availW = W - padding*2;
+  const availH = H - padding*2;
+  // cellSize chosen to fit both directions
+  cellSize = Math.floor(Math.min(availW / cols, availH / rows));
+  const mazeW = cellSize * cols;
+  const mazeH = cellSize * rows;
+  const offsetX = Math.round((W - mazeW)/2);
+  const offsetY = Math.round((H - mazeH)/2);
+
+  // draw corridors: for each cell, draw center square and open neighbors
+  mazeCtx.fillStyle = '#fff';
+  const pad = Math.max(6, Math.floor(cellSize * 0.18)); // corridor half-width padding
+  for(const c of mazeGrid){
+    const cx = offsetX + c.x * cellSize;
+    const cy = offsetY + c.y * cellSize;
+    // center
+    mazeCtx.fillRect(cx + pad, cy + pad, cellSize - pad*2, cellSize - pad*2);
+    // openings for removed walls
+    if(!c.walls.n){
+      mazeCtx.fillRect(cx + pad, cy - pad, cellSize - pad*2, pad*2);
+    }
+    if(!c.walls.s){
+      mazeCtx.fillRect(cx + pad, cy + cellSize - pad, cellSize - pad*2, pad*2);
+    }
+    if(!c.walls.w){
+      mazeCtx.fillRect(cx - pad, cy + pad, pad*2, cellSize - pad*2);
+    }
+    if(!c.walls.e){
+      mazeCtx.fillRect(cx + cellSize - pad, cy + pad, pad*2, cellSize - pad*2);
+    }
+  }
+
+  // mark entrance and exit visually (they are on edges)
+  // Entrance at (0,0) top-left; Exit at (cols-1, rows-1)
+  const ent = mazeGrid[idx(0,0)];
+  exitCell = mazeGrid[idx(cols-1, rows-1)];
+  // draw small marker in exit cell (white already path) -> draw a little rectangle to indicate goal
+  const exX = offsetX + exitCell.x * cellSize + Math.floor(cellSize*0.55);
+  const exY = offsetY + exitCell.y * cellSize + Math.floor(cellSize*0.55);
+  mazeCtx.fillStyle = '#ffd166';
+  mazeCtx.fillRect(exX, exY, Math.max(6, Math.floor(cellSize*0.2)), Math.max(6, Math.floor(cellSize*0.2)));
+
+  // Save rendering offsets for collision checks
+  mazeCanvas._mazeLayout = {offsetX, offsetY, cellSize, pad};
+}
+
+/* ---------- Drawing ink ---------- */
+function clearDraw(){
+  drawCtx.clearRect(0,0,W,H);
+  drawCtx.globalCompositeOperation = 'source-over';
+  drawCtx.lineJoin = 'round';
+  drawCtx.lineCap = 'round';
+}
+
+function drawInkSegment(from, to){
+  const width = Math.max(3, Math.floor(cellSize * 0.22 * (0.6 + ink*0.4))); // width scales with cellSize and ink
+  drawCtx.lineWidth = width;
+  drawCtx.strokeStyle = `rgba(110,231,183,0.95)`;
+  drawCtx.beginPath();
+  drawCtx.moveTo(from.x, from.y);
+  drawCtx.lineTo(to.x, to.y);
+  drawCtx.stroke();
+
+  // subtle bleed
+  drawCtx.globalAlpha = 0.12;
+  drawCtx.lineWidth = width * 2.2;
+  drawCtx.stroke();
+  drawCtx.globalAlpha = 1.0;
+}
+
+/* ---------- Collision: is on white path? ---------- */
+function isOnPath(px, py){
+  if(px<0 || py<0 || px>=W || py>=H) return false;
+  const d = mazeCtx.getImageData(px, py, 1, 1).data;
+  // white path has high R channel
+  return d[0] > 60;
+}
+
+/* ---------- Pointer handling ---------- */
+function getPos(e){
+  const rect = drawCanvas.getBoundingClientRect();
+  let clientX, clientY;
+  if(e.touches && e.touches[0]){ clientX = e.touches[0].clientX; clientY = e.touches[0].clientY; }
+  else { clientX = e.clientX; clientY = e.clientY; }
+  return {
+    x: Math.round((clientX - rect.left) * (drawCanvas.width / rect.width)),
+    y: Math.round((clientY - rect.top) * (drawCanvas.height / rect.height))
+  };
+}
+
+function pointerDown(e){
+  if(gameOver) return;
+  e.preventDefault();
+  const p = getPos(e);
+  if(!isOnPath(p.x, p.y)){
+    endGame('壁に触れた！');
+    return;
+  }
+  drawing = true;
+  lastPos = p;
+  // small dot to start
+  drawCtx.beginPath(); drawCtx.fillStyle = 'rgba(110,231,183,0.95)';
+  drawCtx.arc(p.x, p.y, Math.max(3, cellSize*0.08), 0, Math.PI*2); drawCtx.fill();
+}
+function pointerMove(e){
+  if(!drawing || gameOver) return;
+  e.preventDefault();
+  const p = getPos(e);
+  const dx = p.x - lastPos.x, dy = p.y - lastPos.y;
+  const dist = Math.hypot(dx,dy);
+  const steps = Math.max(1, Math.floor(dist / Math.max(4, cellSize*0.06)));
+  for(let i=1;i<=steps;i++){
+    const t = i/steps;
+    const sx = Math.round(lastPos.x + dx*t);
+    const sy = Math.round(lastPos.y + dy*t);
+    if(!isOnPath(sx, sy)){
+      // draw up to collision point and end
+      drawInkSegment(lastPos, {x:sx,y:sy});
+      ink -= dist * INK_DRAIN_PER_PX;
+      updateGauge();
+      endGame('壁に触れた！');
+      return;
+    }
+  }
+  // draw and drain ink
+  drawInkSegment(lastPos, p);
+  ink -= dist * INK_DRAIN_PER_PX;
+  if(ink <= 0){ ink = 0; updateGauge(); endGame('インク切れ'); return; }
+  updateGauge();
+  lastPos = p;
+
+  // check goal reached: sample a point in exit cell center
+  const layout = mazeCanvas._mazeLayout;
+  if(layout){
+    const exCx = layout.offsetX + exitCell.x * layout.cellSize + Math.floor(layout.cellSize/2);
+    const exCy = layout.offsetY + exitCell.y * layout.cellSize + Math.floor(layout.cellSize/2);
+    const dGoal = Math.hypot(p.x - exCx, p.y - exCy);
+    if(dGoal < layout.cellSize * 0.45){
+      winGame();
+    }
+  }
+}
+function pointerUp(e){
+  drawing = false; lastPos = null;
+}
+
+/* ---------- Gauge and end states ---------- */
+function updateGauge(){
+  const pct = Math.round(Math.max(0, Math.min(1, ink)) * 100);
+  gaugeEl.style.width = pct + '%';
+  inkTxt.textContent = pct + '%';
+}
+function endGame(msg){
+  gameOver = true;
+  drawing = false;
+  overlay.style.display = 'flex';
+  overlay.textContent = msg + ' — 再生成して挑戦してね';
+  // flash effect
+  drawCtx.save();
+  drawCtx.fillStyle = 'rgba(255,30,30,0.06)';
+  drawCtx.fillRect(0,0,W,H);
+  drawCtx.restore();
+}
+
+function winGame(){
+  gameOver = true;
+  drawing = false;
+  overlay.style.display = 'flex';
+  overlay.textContent = 'クリア！おめでとう 🎉 — 再生成で別の迷路へ';
+}
+
+/* ---------- Initialization / regenerate ---------- */
+function setup(){
+  fitCanvases();
+  // determine grid size from difficulty
+  const base = parseInt(difficulty.value,10) || 20;
+  // choose cols proportional to width/height ratio
+  const aspect = W / H;
+  // target rows such that cols x rows fit aspect
+  cols = base;
+  rows = Math.max(6, Math.round(base / aspect * (H/W) * (W/H) + (base * 0.6 * (H/W)))); // heuristic
+  // simpler: make rows proportionally smaller/larger
+  // to keep it simple, set rows depending on chosen base
+  if(base <= 14) { cols = Math.max(10, base); rows = Math.max(6, Math.round(base * 0.66)); }
+  else if(base <= 22){ cols = base; rows = Math.max(8, Math.round(base * 0.6)); }
+  else { cols = base; rows = Math.max(12, Math.round(base * 0.64)); }
+
+  makeGrid(cols, rows);
+  generateMaze();
+  renderMaze();
+  clearDraw();
+  // reset ink (more cells -> more ink needed)
+  const areaFactor = Math.sqrt(cols*rows) / 8;
+  ink = Math.max(0.6, Math.min(1.4, 1.0 * (1.0 + (1.0 - areaFactor*0.08))));
+  ink = Math.min(1, ink); // cap at 1
+  updateGauge();
+  overlay.style.display = 'none';
+  gameOver = false;
+}
+
+/* ---------- Event listeners ---------- */
+function addListeners(){
+  // pointer events
+  drawCanvas.addEventListener('pointerdown', pointerDown);
+  window.addEventListener('pointermove', pointerMove, {passive:false});
+  window.addEventListener('pointerup', pointerUp);
+  // touch cancel
+  window.addEventListener('touchcancel', pointerUp);
+  // regen
+  regenBtn.addEventListener('click', () => { setup(); });
+  difficulty.addEventListener('change', () => { setup(); });
+  // disable context menu on canvas
+  drawCanvas.addEventListener('contextmenu', e=>e.preventDefault());
+  // responsive: on window resize, recompute and regenerate layout
+  window.addEventListener('resize', () => {
+    fitCanvases();
+    // re-render using current mazeGrid shape (recalc cellSize)
+    renderMaze();
+    // keep current drawing cleared to avoid misalignment
+    clearDraw();
+  });
+}
+
+/* ---------- Start ---------- */
+fitCanvases();
+addListeners();
+setup();
+
+</script>
+</body>
+</html>
